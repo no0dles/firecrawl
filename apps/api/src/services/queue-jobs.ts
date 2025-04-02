@@ -81,7 +81,7 @@ async function addScrapeJobRaw(
     // If above by 2x, send them an email
     // No need to 2x as if there are more than the max concurrency in the concurrency queue, it is already 2x
     if(concurrencyQueueJobs > maxConcurrency) {
-      logger.info("Concurrency limited 2x (single) - ", "Concurrency queue jobs: ", concurrencyQueueJobs, "Max concurrency: ", maxConcurrency, "Team ID: ", webScraperOptions.team_id);
+      logger.info("Concurrency limited 2x (single) - ", "Concurrency queue jobs: ", concurrencyQueueJobs, "Current active concurrency: ", currentActiveConcurrency, "Max concurrency: ", maxConcurrency, "Team ID: ", webScraperOptions.team_id);
       
       const shouldSendNotification = await shouldSendConcurrencyLimitNotification(webScraperOptions.team_id);
       if (shouldSendNotification) {

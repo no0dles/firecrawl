@@ -64,7 +64,7 @@ const initializeBrowser = async () => {
   const viewport = { width: 1280, height: 800 };
 
   const contextOptions: any = {
-    userAgent,
+    userAgent: process.env.CUSTOM_USERAGENT ?? userAgent,
     viewport,
   };
 
