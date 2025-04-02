@@ -299,6 +299,8 @@ export function getRateLimiter(
   );
 }
 
+const byPassLimit = process.env.BYPASS_CONCURRENCY_LIMIT ? parseInt(process.env.BYPASS_CONCURRENCY_LIMIT) : CONCURRENCY_LIMIT.manual;
+
 export function getConcurrencyLimitMax(
   plan: PlanType,
   teamId?: string,
@@ -307,6 +309,10 @@ export function getConcurrencyLimitMax(
   // if (token && testSuiteTokens.some((testToken) => token.includes(testToken))) {
   //   return CONCURRENCY_LIMIT.testSuite;
   // }
+  if (teamId === 'bypass') {
+    return byPassLimit;
+  }
+
   if (teamId && teamId === process.env.DEV_B_TEAM_ID) {
     return CONCURRENCY_LIMIT.devB;
   }
