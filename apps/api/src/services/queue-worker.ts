@@ -883,7 +883,7 @@ async function processJob(job: Job & { id: string }, token: string) {
   // }
 
   try {
-    job.updateProgress({
+    await job.updateProgress({
       current: 1,
       total: 100,
       current_step: "SCRAPING",

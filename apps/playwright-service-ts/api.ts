@@ -152,73 +152,78 @@ const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networki
 };
 
 app.post('/scrape', async (req: Request, res: Response) => {
-  const { url, wait_after_load = 0, timeout = 15000, headers, check_selector }: UrlModel = req.body;
-
-  console.log(`================= Scrape Request =================`);
-  console.log(`URL: ${url}`);
-  console.log(`Wait After Load: ${wait_after_load}`);
-  console.log(`Timeout: ${timeout}`);
-  console.log(`Headers: ${headers ? JSON.stringify(headers) : 'None'}`);
-  console.log(`Check Selector: ${check_selector ? check_selector : 'None'}`);
-  console.log(`==================================================`);
-
-  if (!url) {
-    return res.status(400).json({ error: 'URL is required' });
-  }
-
-  if (!isValidUrl(url)) {
-    return res.status(400).json({ error: 'Invalid URL' });
-  }
-
-  if (!PROXY_SERVER) {
-    console.warn('⚠️ WARNING: No proxy server provided. Your IP address may be blocked.');
-  }
-
-  if (!browser || !context) {
-    await initializeBrowser();
-  }
-
-  const page = await context.newPage();
-
-  // Set headers if provided
-  if (headers) {
-    await page.setExtraHTTPHeaders(headers);
-  }
-
-  let result: Awaited<ReturnType<typeof scrapePage>>;
   try {
-    // Strategy 1: Normal
-    console.log('Attempting strategy 1: Normal load');
-    result = await scrapePage(page, url, 'load', wait_after_load, timeout, check_selector);
-  } catch (error) {
-    console.log('Strategy 1 failed, attempting strategy 2: Wait until networkidle');
-    try {
-      // Strategy 2: Wait until networkidle
-      result = await scrapePage(page, url, 'networkidle', wait_after_load, timeout, check_selector);
-    } catch (finalError) {
-      await page.close();
-      return res.status(500).json({ error: 'An error occurred while fetching the page.' });
+    const {url, wait_after_load = 0, timeout = 15000, headers, check_selector}: UrlModel = req.body;
+
+    console.log(`================= Scrape Request =================`);
+    console.log(`URL: ${url}`);
+    console.log(`Wait After Load: ${wait_after_load}`);
+    console.log(`Timeout: ${timeout}`);
+    console.log(`Headers: ${headers ? JSON.stringify(headers) : 'None'}`);
+    console.log(`Check Selector: ${check_selector ? check_selector : 'None'}`);
+    console.log(`==================================================`);
+
+    if (!url) {
+      return res.status(400).json({error: 'URL is required'});
     }
+
+    if (!isValidUrl(url)) {
+      return res.status(400).json({error: 'Invalid URL'});
+    }
+
+    if (!PROXY_SERVER) {
+      console.warn('⚠️ WARNING: No proxy server provided. Your IP address may be blocked.');
+    }
+
+    if (!browser || !context) {
+      await initializeBrowser();
+    }
+
+    const page = await context.newPage();
+
+    // Set headers if provided
+    if (headers) {
+      await page.setExtraHTTPHeaders(headers);
+    }
+
+    let result: Awaited<ReturnType<typeof scrapePage>>;
+    try {
+      // Strategy 1: Normal
+      console.log('Attempting strategy 1: Normal load');
+      result = await scrapePage(page, url, 'load', wait_after_load, timeout, check_selector);
+    } catch (error) {
+      console.log('Strategy 1 failed, attempting strategy 2: Wait until networkidle');
+      try {
+        // Strategy 2: Wait until networkidle
+        result = await scrapePage(page, url, 'networkidle', wait_after_load, timeout, check_selector);
+      } catch (finalError) {
+        await page.close();
+        return res.status(500).json({error: 'An error occurred while fetching the page.'});
+      }
+    }
+
+    const pageError = result.status !== 200 ? getError(result.status) : undefined;
+
+    if (!pageError) {
+      console.log(`✅ Scrape successful!`);
+    } else {
+      console.log(`🚨 Scrape failed with status code: ${result.status} ${pageError}`);
+    }
+
+    await page.close();
+
+    res.json({
+      content: result.content,
+      pageStatusCode: result.status,
+      ...(pageError && {pageError})
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e instanceof Error ? e.message : 'unknown error'});
   }
-
-  const pageError = result.status !== 200 ? getError(result.status) : undefined;
-
-  if (!pageError) {
-    console.log(`✅ Scrape successful!`);
-  } else {
-    console.log(`🚨 Scrape failed with status code: ${result.status} ${pageError}`);
-  }
-
-  await page.close();
-
-  res.json({
-    content: result.content,
-    pageStatusCode: result.status,
-    ...(pageError && { pageError })
-  });
 });
 
-app.listen(port, () => {
+app.listen(port, '0.0.0.0', () => {
   initializeBrowser().then(() => {
     console.log(`Server is running on port ${port}`);
   });
