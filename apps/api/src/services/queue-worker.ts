@@ -599,9 +599,9 @@ const workerFun = async (
           runningJobs.delete(job.id);
         }
 
-        if (job.id && job.data && job.data.team_id && job.data.plan) {
+        if (job.id && job.data && job.data.team_id) {
           await removeConcurrencyLimitActiveJob(job.data.team_id, job.id);
-          cleanOldConcurrencyLimitEntries(job.data.team_id);
+          await cleanOldConcurrencyLimitEntries(job.data.team_id);
 
           // Queue up next job, if it exists
           // No need to check if we're under the limit here -- if the current job is finished,
