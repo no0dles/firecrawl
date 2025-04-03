@@ -274,7 +274,7 @@ const processJobInternal = async (token: string, job: Job & { id: string }) => {
         try {
           if (
             job.data.crawl_id &&
-            process.env.USE_DB_AUTHENTICATION === "true"
+            (process.env.USE_DB_AUTHENTICATION === "true" || job.data.webhook)
           ) {
             logger.debug(
               "Job succeeded -- has crawl associated, putting null in Redis",
