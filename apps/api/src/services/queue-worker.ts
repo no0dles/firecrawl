@@ -181,7 +181,7 @@ async function finishCrawlIfNeeded(job: Job & { id: string }, sc: StoredCrawl) {
 
       // v0 web hooks, call when done with all the data
       if (!job.data.v1) {
-        callWebhook(
+        await callWebhook(
           job.data.team_id,
           job.data.crawl_id,
           data,
@@ -218,7 +218,7 @@ async function finishCrawlIfNeeded(job: Job & { id: string }, sc: StoredCrawl) {
 
       // v1 web hooks, call when done with no data, but with event completed
       if (job.data.v1 && job.data.webhook) {
-        callWebhook(
+        await callWebhook(
           job.data.team_id,
           job.data.crawl_id,
           [],
@@ -1240,7 +1240,7 @@ async function processJob(job: Job & { id: string }, token: string) {
     };
 
     if (!job.data.v1 && (job.data.mode === "crawl" || job.data.crawl_id)) {
-      callWebhook(
+      await callWebhook(
         job.data.team_id,
         job.data.crawl_id ?? (job.id as string),
         data,
