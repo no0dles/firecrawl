@@ -274,7 +274,7 @@ const processJobInternal = async (token: string, job: Job & { id: string }) => {
         try {
           if (
             job.data.crawl_id &&
-            (process.env.USE_DB_AUTHENTICATION === "true" || job.data.webhook)
+            process.env.USE_DB_AUTHENTICATION === "true"
           ) {
             logger.debug(
               "Job succeeded -- has crawl associated, putting null in Redis",
@@ -282,7 +282,8 @@ const processJobInternal = async (token: string, job: Job & { id: string }) => {
             await job.moveToCompleted(null, token, false);
           } else {
             logger.debug("Job succeeded -- putting result in Redis");
-            await job.moveToCompleted(result.document, token, false);
+
+            await job.moveToCompleted(job.data.webhook ? { metadata: { sourceURL: result.document?.metadata?.sourceURL } } : result.document, token, false);
           }
         } catch (e) {}
       } else {
