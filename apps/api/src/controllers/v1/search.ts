@@ -1,5 +1,4 @@
 import { Response } from "express";
-import { logger } from "../../lib/logger";
 import {
   Document,
   RequestWithAuth,
@@ -7,48 +6,58 @@ import {
   SearchResponse,
   searchRequestSchema,
   ScrapeOptions,
+  TeamFlags,
 } from "./types";
 import { billTeam } from "../../services/billing/credit_billing";
 import { v4 as uuidv4 } from "uuid";
 import { addScrapeJob, waitForJob } from "../../services/queue-jobs";
 import { logJob } from "../../services/logging/log_job";
 import { getJobPriority } from "../../lib/job-priority";
-import { PlanType, Mode } from "../../types";
+import { Mode } from "../../types";
 import { getScrapeQueue } from "../../services/queue-service";
 import { search } from "../../search";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import * as Sentry from "@sentry/node";
 import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
+import { logger as _logger } from "../../lib/logger";
+import type { Logger } from "winston";
+import { getJobFromGCS } from "../../lib/gcs-jobs";
+import { CostTracking } from "../../lib/extract/extraction-service";
 
 // Used for deep research
 export async function searchAndScrapeSearchResult(
   query: string,
   options: {
     teamId: string;
-    plan: PlanType | undefined;
     origin: string;
     timeout: number;
     scrapeOptions: ScrapeOptions;
-  }
+  },
+  logger: Logger,
+  costTracking: CostTracking,
+  flags: TeamFlags,
 ): Promise<Document[]> {
   try {
     const searchResults = await search({
       query,
-      num_results: 5
-  });
+      num_results: 5,
+    });
 
-  const documents = await Promise.all(
-    searchResults.map(result => 
-      scrapeSearchResult(
-        {
-          url: result.url,
-          title: result.title,
-          description: result.description
-        },
-        options
-      )
-    )
-  );
+    const documents = await Promise.all(
+      searchResults.map((result) =>
+        scrapeSearchResult(
+          {
+            url: result.url,
+            title: result.title,
+            description: result.description,
+          },
+          options,
+          logger,
+          costTracking,
+          flags,
+        ),
+      ),
+    );
 
     return documents;
   } catch (error) {
@@ -60,40 +69,57 @@ async function scrapeSearchResult(
   searchResult: { url: string; title: string; description: string },
   options: {
     teamId: string;
-    plan: PlanType | undefined;
     origin: string;
     timeout: number;
     scrapeOptions: ScrapeOptions;
   },
+  logger: Logger,
+  costTracking: CostTracking,
+  flags: TeamFlags,
+  directToBullMQ: boolean = false,
+  isSearchPreview: boolean = false,
 ): Promise<Document> {
   const jobId = uuidv4();
   const jobPriority = await getJobPriority({
-    plan: options.plan as PlanType,
     team_id: options.teamId,
     basePriority: 10,
   });
 
   try {
-    if (isUrlBlocked(searchResult.url)) {
+    if (isUrlBlocked(searchResult.url, flags)) {
       throw new Error("Could not scrape url: " + BLOCKLISTED_URL_MESSAGE);
     }
+    logger.info("Adding scrape job", {
+      scrapeId: jobId,
+      url: searchResult.url,
+      teamId: options.teamId,
+      origin: options.origin,
+    });
     await addScrapeJob(
       {
         url: searchResult.url,
         mode: "single_urls" as Mode,
         team_id: options.teamId,
         scrapeOptions: options.scrapeOptions,
-        internalOptions: {},
-        plan: options.plan || "free",
+        internalOptions: { teamId: options.teamId, useCache: true, bypassBilling: true },
         origin: options.origin,
         is_scrape: true,
+        startTime: Date.now(),
       },
       {},
       jobId,
       jobPriority,
+      directToBullMQ,
     );
 
-    const doc = await waitForJob<Document>(jobId, options.timeout);
+    const doc: Document = await waitForJob(jobId, options.timeout);
+
+    logger.info("Scrape job completed", {
+      scrapeId: jobId,
+      url: searchResult.url,
+      teamId: options.teamId,
+      origin: options.origin,
+    });
     await getScrapeQueue().remove(jobId);
 
     // Move SERP results to top level
@@ -105,6 +131,7 @@ async function scrapeSearchResult(
     };
   } catch (error) {
     logger.error(`Error in scrapeSearchResult: ${error}`, {
+      scrapeId: jobId,
       url: searchResult.url,
       teamId: options.teamId,
     });
@@ -121,6 +148,7 @@ async function scrapeSearchResult(
       metadata: {
         statusCode,
         error: error.message,
+        proxyUsed: "basic",
       },
     };
   }
@@ -130,16 +158,36 @@ export async function searchController(
   req: RequestWithAuth<{}, SearchResponse, SearchRequest>,
   res: Response<SearchResponse>,
 ) {
+  const jobId = uuidv4();
+  let logger = _logger.child({
+    jobId,
+    teamId: req.auth.team_id,
+    module: "search",
+    method: "searchController",
+  });
+
+  let responseData: SearchResponse = {
+    success: true,
+    data: [],
+  };
+  const startTime = new Date().getTime();
+  const costTracking = new CostTracking();
+  const isSearchPreview = process.env.SEARCH_PREVIEW_TOKEN !== undefined && process.env.SEARCH_PREVIEW_TOKEN === req.body.__searchPreviewToken;
+
   try {
     req.body = searchRequestSchema.parse(req.body);
 
-    const jobId = uuidv4();
-    const startTime = new Date().getTime();
+    logger = logger.child({
+      query: req.body.query,
+      origin: req.body.origin,
+    });
 
     let limit = req.body.limit;
 
     // Buffer results by 50% to account for filtered URLs
     const num_results_buffer = Math.floor(limit * 2);
+
+    logger.info("Searching for results");
 
     let searchResults = await search({
       query: req.body.query,
@@ -152,93 +200,121 @@ export async function searchController(
       location: req.body.location,
     });
 
+    if (req.body.ignoreInvalidURLs) {
+      searchResults = searchResults.filter(
+        (result) => !isUrlBlocked(result.url, req.acuc?.flags ?? null),
+      );
+    }
+
+    logger.info("Searching completed", {
+      num_results: searchResults.length,
+    });
+
     // Filter blocked URLs early to avoid unnecessary billing
     if (searchResults.length > limit) {
       searchResults = searchResults.slice(0, limit);
     }
 
     if (searchResults.length === 0) {
-      return res.status(200).json({
-        success: true,
-        data: [],
-        warning: "No search results found",
-      });
-    }
-
-    if (
+      logger.info("No search results found");
+      responseData.warning = "No search results found";
+    } else if (
       !req.body.scrapeOptions.formats ||
       req.body.scrapeOptions.formats.length === 0
     ) {
-      billTeam(req.auth.team_id, req.acuc?.sub_id, searchResults.length).catch(
-        (error) => {
-          logger.error(
-            `Failed to bill team ${req.auth.team_id} for ${searchResults.length} credits: ${error}`,
-          );
-        },
+      responseData.data = searchResults.map((r) => ({
+        url: r.url,
+        title: r.title,
+        description: r.description,
+      })) as Document[];
+    } else {
+      logger.info("Scraping search results");
+      const scrapePromises = searchResults.map((result) =>
+        scrapeSearchResult(
+          result,
+          {
+            teamId: req.auth.team_id,
+            origin: req.body.origin,
+            timeout: req.body.timeout,
+            scrapeOptions: req.body.scrapeOptions,
+          },
+          logger,
+          costTracking,
+          req.acuc?.flags ?? null,
+          (req.acuc?.price_credits ?? 0) <= 3000,
+          isSearchPreview,
+        ),
       );
-      return res.status(200).json({
-        success: true,
-        data: searchResults.map((r) => ({
-          url: r.url,
-          title: r.title,
-          description: r.description,
-        })) as Document[],
+
+      const docs = await Promise.all(scrapePromises);
+      logger.info("Scraping completed", {
+        num_docs: docs.length,
       });
+
+      const filteredDocs = docs.filter(
+        (doc) =>
+          doc.serpResults || (doc.markdown && doc.markdown.trim().length > 0),
+      );
+
+      logger.info("Filtering completed", {
+        num_docs: filteredDocs.length,
+      });
+
+      if (filteredDocs.length === 0) {
+        responseData.data = docs;
+        responseData.warning = "No content found in search results";
+      } else {
+        responseData.data = filteredDocs;
+      }
     }
 
-    // Scrape each non-blocked result, handling timeouts individually
-    const scrapePromises = searchResults.map((result) =>
-      scrapeSearchResult(result, {
-        teamId: req.auth.team_id,
-        plan: req.auth.plan,
-        origin: req.body.origin,
-        timeout: req.body.timeout,
-        scrapeOptions: req.body.scrapeOptions,
-      }),
-    );
-
-    const docs = await Promise.all(scrapePromises);
-
-    // Bill for successful scrapes only
-    billTeam(req.auth.team_id, req.acuc?.sub_id, docs.length).catch((error) => {
-      logger.error(
-        `Failed to bill team ${req.auth.team_id} for ${docs.length} credits: ${error}`,
-      );
-    });
-
-    // Filter out empty content but keep docs with SERP results
-    const filteredDocs = docs.filter(
-      (doc) =>
-        doc.serpResults || (doc.markdown && doc.markdown.trim().length > 0),
-    );
-
-    if (filteredDocs.length === 0) {
-      return res.status(200).json({
-        success: true,
-        data: docs,
-        warning: "No content found in search results",
+    // Bill team once for all successful results
+    if (!isSearchPreview) {
+      billTeam(
+        req.auth.team_id,
+        req.acuc?.sub_id,
+        responseData.data.reduce((a, x) => {
+          if (x.metadata?.numPages !== undefined && x.metadata.numPages > 0) {
+            return a + x.metadata.numPages;
+          } else {
+            return a + 1;
+          }
+        }, 0),
+      ).catch((error) => {
+        logger.error(
+          `Failed to bill team ${req.auth.team_id} for ${responseData.data.length} credits: ${error}`,
+        );
       });
     }
 
     const endTime = new Date().getTime();
     const timeTakenInSeconds = (endTime - startTime) / 1000;
 
-    logJob({
-      job_id: jobId,
-      success: true,
-      num_docs: filteredDocs.length,
-      docs: filteredDocs,
+    logger.info("Logging job", {
+      num_docs: responseData.data.length,
       time_taken: timeTakenInSeconds,
-      team_id: req.auth.team_id,
-      mode: "search",
-      url: req.body.query,
-      origin: req.body.origin,
     });
 
-    return res.status(200).json({
-      success: true,
-      data: filteredDocs,
-    });
+    logJob(
+      {
+        job_id: jobId,
+        success: true,
+        num_docs: responseData.data.length,
+        docs: responseData.data,
+        time_taken: timeTakenInSeconds,
+        team_id: req.auth.team_id,
+        mode: "search",
+        url: req.body.query,
+        scrapeOptions: req.body.scrapeOptions,
+        origin: req.body.origin,
+        integration: req.body.integration,
+        cost_tracking: costTracking,
+      },
+      false,
+      isSearchPreview,
+    );
+
+    return res.status(200).json(responseData);
   } catch (error) {
     if (
       error instanceof Error &&

@@ -1,12 +1,14 @@
 import { z } from "zod";
 import {
   AuthCreditUsageChunk,
+  BaseScrapeOptions,
   ScrapeOptions,
   Document as V1Document,
   webhookSchema,
 } from "./controllers/v1/types";
 import { ExtractorOptions, Document } from "./lib/entities";
 import { InternalOptions } from "./scraper/scrapeURL";
+import type { CostTracking } from "./lib/extract/extraction-service";
 
 type Mode = "crawl" | "single_urls" | "sitemap";
 
@@ -34,17 +36,24 @@ export interface WebScraperOptions {
   url: string;
   mode: Mode;
   crawlerOptions?: any;
-  scrapeOptions: ScrapeOptions;
+  scrapeOptions: BaseScrapeOptions;
   internalOptions?: InternalOptions;
   team_id: string;
-  plan: string;
   origin?: string;
   crawl_id?: string;
   sitemapped?: boolean;
   webhook?: z.infer<typeof webhookSchema>;
   v1?: boolean;
+  integration?: string | null;
+
+  /**
+   * Disables billing on the worker side.
+   */
   is_scrape?: boolean;
+
   isCrawlSourceScrape?: boolean;
+  from_extract?: boolean;
+  startTime?: number;
 }
 
 export interface RunWebScraperParams {
@@ -59,6 +68,8 @@ export interface RunWebScraperParams {
   priority?: number;
   is_scrape?: boolean;
   is_crawl?: boolean;
+  urlInvisibleInCurrentCrawl?: boolean;
+  costTracking: CostTracking;
 }
 
 export type RunWebScraperResult =
@@ -84,11 +95,16 @@ export interface FirecrawlJob {
   crawlerOptions?: any;
   scrapeOptions?: any;
   origin: string;
+  integration?: string | null;
   num_tokens?: number;
   retry?: boolean;
   crawl_id?: string;
   tokens_billed?: number;
   sources?: Record<string, string[]>;
+  cost_tracking?: CostTracking;
+  pdf_num_pages?: number;
+  credits_billed?: number | null;
+  change_tracking_tag?: string | null;
 }
 
 export interface FirecrawlScrapeResponse {
@@ -131,11 +147,13 @@ export enum RateLimiterMode {
   Crawl = "crawl",
   CrawlStatus = "crawlStatus",
   Scrape = "scrape",
+  ScrapeAgentPreview = "scrapeAgentPreview",
   Preview = "preview",
   Search = "search",
   Map = "map",
   Extract = "extract",
   ExtractStatus = "extractStatus",
+  ExtractAgentPreview = "extractAgentPreview",
 }
 
 export type AuthResponse =
@@ -143,7 +161,6 @@ export type AuthResponse =
       success: true;
       team_id: string;
       api_key?: string;
-      plan?: PlanType;
       chunk: AuthCreditUsageChunk | null;
     }
   | {
@@ -176,30 +193,6 @@ export type ScrapeLog = {
   ipv4_support?: boolean | null;
   ipv6_support?: boolean | null;
 };
-
-export type PlanType =
-  | "starter"
-  | "standard"
-  | "scale"
-  | "hobby"
-  | "standardnew"
-  | "standardNew"
-  | "growth"
-  | "growthdouble"
-  | "etier2c"
-  | "etier1a"
-  | "etierscale1"
-  | "etierscale2"
-  | "etier2a"
-  | "free"
-  | "testSuite"
-  | "devB"
-  | "etier2d"
-  | "manual"
-  | "extract_starter"
-  | "extract_explorer"
-  | "extract_pro"
-  | "";
 
 export type WebhookEventType =
   | "crawl.page"

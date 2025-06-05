@@ -1,7 +1,7 @@
 import { batchScrape, crawl, creditUsage, extract, map, scrape, search, tokenUsage } from "./lib";
 
 const sleep = (ms: number) => new Promise(x => setTimeout(() => x(true), ms));
-const sleepForBatchBilling = () => sleep(20000);
+const sleepForBatchBilling = () => sleep(40000);
 
 beforeAll(async () => {
     // Wait for previous test runs to stop billing processing
@@ -107,6 +107,7 @@ describe("Billing tests", () => {
                 // crawl 1: regular fc.dev crawl (x credits)
                 crawl({
                     url: "https://firecrawl.dev",
+                    limit: 10,
                 }),
                 
                 // crawl 2: fc.dev crawl with json (5y credits)
@@ -123,7 +124,8 @@ describe("Billing tests", () => {
                                 required: ["four_word_summary"],
                             },
                         },
-                    }
+                    },
+                    limit: 10,
                 })
             ]);
             
@@ -162,6 +164,23 @@ describe("Billing tests", () => {
 
             expect(rc1 - rc2).toBe(results.length);
         }, 60000);
+
+        it("bills search with scrape correctly", async () => {
+            const rc1 = (await creditUsage()).remaining_credits;
+
+            const results = await search({
+                query: "firecrawl",
+                scrapeOptions: {
+                    formats: ["markdown"],
+                },
+            });
+
+            await sleepForBatchBilling();
+
+            const rc2 = (await creditUsage()).remaining_credits;
+
+            expect(rc1 - rc2).toBe(results.length);
+        }, 600000);
 
         it("bills extract correctly", async () => {
             const rc1 = (await tokenUsage()).remaining_tokens;

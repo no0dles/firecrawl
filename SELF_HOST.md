@@ -86,9 +86,6 @@ USE_DB_AUTHENTICATION=false
 # Use if you've set up authentication and want to test with a real API key
 # TEST_API_KEY=
 
-# You can add this to enable ScrapingBee as a fallback scraping engine.
-# SCRAPING_BEE_API_KEY=
-
 # This key lets you access the queue admin panel. Change this if your deployment is publicly accessible.
 BULL_AUTH_KEY=CHANGEME
 
@@ -106,6 +103,15 @@ BULL_AUTH_KEY=CHANGEME
 # Set if you'd like to send posthog events like job logs
 # POSTHOG_API_KEY=
 # POSTHOG_HOST=
+
+## === System Resource Configuration ===
+# Maximum CPU usage threshold (0.0-1.0). Worker will reject new jobs when CPU usage exceeds this value.
+# Default: 0.8 (80%)
+# MAX_CPU=0.8
+
+# Maximum RAM usage threshold (0.0-1.0). Worker will reject new jobs when memory usage exceeds this value.
+# Default: 0.8 (80%)
+# MAX_RAM=0.8
 ```
 
 3.  Build and run the Docker containers:

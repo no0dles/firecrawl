@@ -1,6 +1,6 @@
 // Import necessary dependencies and types
 import { AuthCreditUsageChunk } from "../../controllers/v1/types";
-import { getACUC } from "../../controllers/auth";
+import { clearACUC, clearACUCTeam, getACUC } from "../../controllers/auth";
 import { redlock } from "../redlock";
 import { supabase_rr_service, supabase_service } from "../supabase";
 import { createPaymentIntent } from "./stripe";
@@ -124,7 +124,7 @@ export async function autoCharge(
           if (chunk.sub_user_id) {
             // Fetch the customer's Stripe information
             const { data: customer, error: customersError } =
-              await supabase_service
+              await supabase_rr_service
                 .from("customers")
                 .select("id, stripe_customer_id")
                 .eq("id", chunk.sub_user_id)
@@ -210,8 +210,8 @@ export async function autoCharge(
                 );
 
                 // Reset ACUC cache to reflect the new credit balance
-                const cacheKeyACUC = `acuc_${chunk.api_key}`;
-                await deleteKey(cacheKeyACUC);
+                await clearACUC(chunk.api_key);
+                await clearACUCTeam(chunk.team_id);
 
                 if (process.env.SLACK_ADMIN_WEBHOOK_URL) {
                   const webhookCooldownKey = `webhook_cooldown_${chunk.team_id}`;

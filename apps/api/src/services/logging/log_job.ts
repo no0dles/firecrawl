@@ -1,10 +1,10 @@
-import { ExtractorOptions } from "./../../lib/entities";
 import { supabase_service } from "../supabase";
 import { FirecrawlJob } from "../../types";
 import { posthog } from "../posthog";
 import "dotenv/config";
 import { logger } from "../../lib/logger";
 import { configDotenv } from "dotenv";
+import { saveJobToGCS } from "../../lib/gcs-jobs";
 configDotenv();
 
 function cleanOfNull<T>(x: T): T {
@@ -21,53 +21,13 @@ function cleanOfNull<T>(x: T): T {
   }
 }
 
-async function indexJob(job: FirecrawlJob): Promise<void> {
-  try {
-    if (job.mode !== "single_urls" && job.mode !== "scrape") {
-      return;
-    }
-
-    const response = await fetch(`${process.env.FIRE_INDEX_SERVER_URL}/api/jobs`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        url: job.url,
-        mode: job.mode || "scrape",
-        docs: job.docs,
-        origin: job.origin,
-        success: job.success,
-        time_taken: job.time_taken,
-        num_tokens: job.num_tokens,
-        page_options: job.scrapeOptions,
-        date_added: new Date().toISOString(),
-      }),
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      logger.error(`Failed to send job to external server: ${response.status} ${response.statusText}`, {
-        error: errorData,
-        scrapeId: job.job_id,
-      });
-    } else {
-      logger.debug("Job sent to external server successfully!", { scrapeId: job.job_id });
-    }
-  } catch (error) {
-    logger.error(`Error sending job to external server: ${error.message}`, {
-      error,
-      scrapeId: job.job_id,
-    });
-  }
-}
-
-export async function logJob(job: FirecrawlJob, force: boolean = false) {
+export async function logJob(job: FirecrawlJob, force: boolean = false, bypassLogging: boolean = false) {
   try {
     const useDbAuthentication = process.env.USE_DB_AUTHENTICATION === "true";
     if (!useDbAuthentication) {
       return;
     }
+    
 
     // Redact any pages that have an authorization header
     // actually, Don't. we use the db to retrieve results now. this breaks authed crawls - mogery
@@ -89,7 +49,7 @@ export async function logJob(job: FirecrawlJob, force: boolean = false) {
       success: job.success,
       message: job.message,
       num_docs: job.num_docs,
-      docs: cleanOfNull(job.docs),
+      docs: ((job.mode === "single_urls" || job.mode === "scrape") && process.env.GCS_BUCKET_NAME) ? null : cleanOfNull(job.docs),
       time_taken: job.time_taken,
       team_id: (job.team_id === "preview" || job.team_id?.startsWith("preview_"))? null : job.team_id,
       mode: job.mode,
@@ -97,15 +57,24 @@ export async function logJob(job: FirecrawlJob, force: boolean = false) {
       crawler_options: job.crawlerOptions,
       page_options: job.scrapeOptions,
       origin: job.origin,
+      integration: job.integration ?? null,
       num_tokens: job.num_tokens,
       retry: !!job.retry,
       crawl_id: job.crawl_id,
       tokens_billed: job.tokens_billed,
+      is_migrated: true,
+      cost_tracking: job.cost_tracking,
+      pdf_num_pages: job.pdf_num_pages ?? null,
+      credits_billed: job.credits_billed ?? null,
+      change_tracking_tag: job.change_tracking_tag ?? null,
     };
 
-    // Send job to external server
-    if (process.env.FIRE_INDEX_SERVER_URL) {
-      indexJob(job);
+    if (process.env.GCS_BUCKET_NAME) {
+      await saveJobToGCS(job);
+    }
+
+    if (bypassLogging) {
+      return;
     }
 
     if (force) {
@@ -176,6 +145,9 @@ export async function logJob(job: FirecrawlJob, force: boolean = false) {
           num_tokens: job.num_tokens,
           retry: job.retry,
           tokens_billed: job.tokens_billed,
+          cost_tracking: job.cost_tracking,
+          pdf_num_pages: job.pdf_num_pages,
+          change_tracking_tag: job.change_tracking_tag ?? null,
         },
       };
       if (job.mode !== "single_urls") {

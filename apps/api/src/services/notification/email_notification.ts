@@ -7,7 +7,7 @@ import { sendSlackWebhook } from "../alerts/slack";
 import { getNotificationString } from "./notification_string";
 import { AuthCreditUsageChunk } from "../../controllers/v1/types";
 import { redlock } from "../redlock";
-import { redisConnection } from "../queue-service";
+import { redisEvictConnection } from "../redis";
 
 const emailTemplates: Record<
   NotificationType,
@@ -44,8 +44,19 @@ const emailTemplates: Record<
     <br/>
     <p>We've improved our system by transitioning to concurrency limits, allowing faster scraping by default and eliminating* the often rate limit errors.</p>
     <p>You're hitting the concurrency limit for your plan quite often, which means Firecrawl can't scrape as fast as it could. But don't worry, it is not failing your requests and you are still getting your results.</p>
-    <p>This is just to let you know that you could be scraping more pages faster. Consider upgrading your plan at <a href='https://firecrawl.dev/pricing'>firecrawl.dev/pricing</a>.</p><br/>Thanks,<br/>Firecrawl Team<br/>`,
+    <p>This is just to let you know that you could be scraping faster. Consider upgrading your plan at <a href='https://firecrawl.dev/pricing'>firecrawl.dev/pricing</a>.</p><br/>Thanks,<br/>Firecrawl Team<br/>`,
   },
+};
+
+// Map notification types to email categories
+const notificationToEmailCategory: Record<NotificationType, 'rate_limit_warnings' | 'system_alerts'> = {
+  [NotificationType.APPROACHING_LIMIT]: 'system_alerts',
+  [NotificationType.LIMIT_REACHED]: 'system_alerts',
+  [NotificationType.RATE_LIMIT_REACHED]: 'rate_limit_warnings',
+  [NotificationType.AUTO_RECHARGE_SUCCESS]: 'system_alerts',
+  [NotificationType.AUTO_RECHARGE_FAILED]: 'system_alerts',
+  [NotificationType.CONCURRENCY_LIMIT_REACHED]: 'rate_limit_warnings',
+  [NotificationType.AUTO_RECHARGE_FREQUENT]: 'system_alerts',
 };
 
 export async function sendNotification(
@@ -66,14 +77,57 @@ export async function sendNotification(
   );
 }
 
-export async function sendEmailNotification(
+async function sendEmailNotification(
   email: string,
   notificationType: NotificationType,
 ) {
   const resend = new Resend(process.env.RESEND_API_KEY);
 
   try {
-    const { data, error } = await resend.emails.send({
+    // Get user's email preferences
+    const { data: user, error: userError } = await supabase_service
+      .from("users")
+      .select("id")
+      .eq("email", email)
+      .single();
+
+    if (userError) {
+      logger.debug(`Error fetching user: ${userError}`);
+      return { success: false };
+    }
+
+    // Check user's email preferences
+    const { data: preferences, error: prefError } = await supabase_service
+      .from("notification_preferences")
+      .select("unsubscribed_all, email_preferences")
+      .eq("user_id", user.id)
+      .single();
+
+    if (prefError) {
+      logger.debug(`Error fetching preferences: ${prefError}`);
+      return { success: false };
+    }
+
+    // If user has unsubscribed from all emails or we can't find their preferences, don't send
+    if (!preferences || preferences.unsubscribed_all) {
+      logger.debug(`User ${email} has unsubscribed from all emails or preferences not found`);
+      return { success: true }; // Return success since this is an expected case
+    }
+
+    // Get the email category for this notification type
+    const emailCategory = notificationToEmailCategory[notificationType];
+
+    // If user has unsubscribed from this category of emails, don't send
+    if (
+      preferences.email_preferences &&
+      Array.isArray(preferences.email_preferences) &&
+      !preferences.email_preferences.includes(emailCategory)
+    ) {
+      logger.debug(`User ${email} has unsubscribed from ${emailCategory} emails`);
+      return { success: true }; // Return success since this is an expected case
+    }
+
+    const { error } = await resend.emails.send({
       from: "Firecrawl <firecrawl@getmendableai.com>",
       to: [email],
       reply_to: "help@firecrawl.com",
@@ -85,13 +139,15 @@ export async function sendEmailNotification(
       logger.debug(`Error sending email: ${error}`);
       return { success: false };
     }
+
+    return { success: true };
   } catch (error) {
     logger.debug(`Error sending email (2): ${error}`);
     return { success: false };
   }
 }
 
-export async function sendNotificationInternal(
+async function sendNotificationInternal(
   team_id: string,
   notificationType: NotificationType,
   startDateString: string | null,
@@ -212,14 +268,14 @@ export async function sendNotificationWithCustomDays(
   ) => {
     const redisKey = "notification_sent:" + notificationType + ":" + team_id;
 
-    const didSendRecentNotification = (await redisConnection.get(redisKey)) !== null;
+    const didSendRecentNotification = (await redisEvictConnection.get(redisKey)) !== null;
 
     if (didSendRecentNotification && !bypassRecentChecks) {
       logger.debug(`Notification already sent within the last ${daysBetweenEmails} days for team_id: ${team_id} and notificationType: ${notificationType}`);
       return { success: true };
     }
     
-    await redisConnection.set(redisKey, "1", "EX", daysBetweenEmails * 24 * 60 * 60);
+    await redisEvictConnection.set(redisKey, "1", "EX", daysBetweenEmails * 24 * 60 * 60);
 
     const now = new Date();
     const pastDate = new Date(now.getTime() - daysBetweenEmails * 24 * 60 * 60 * 1000);
@@ -233,13 +289,13 @@ export async function sendNotificationWithCustomDays(
 
     if (recentNotificationsError) {
       logger.debug(`Error fetching recent notifications: ${recentNotificationsError}`);
-      await redisConnection.del(redisKey); // free up redis, let it try again
+      await redisEvictConnection.del(redisKey); // free up redis, let it try again
       return { success: false };
     }
 
     if (recentNotifications.length > 0 && !bypassRecentChecks) {
       logger.debug(`Notification already sent within the last ${daysBetweenEmails} days for team_id: ${team_id} and notificationType: ${notificationType}`);
-      await redisConnection.set(redisKey, "1", "EX", daysBetweenEmails * 24 * 60 * 60);
+      await redisEvictConnection.set(redisKey, "1", "EX", daysBetweenEmails * 24 * 60 * 60);
       return { success: true };
     }
 
@@ -254,7 +310,7 @@ export async function sendNotificationWithCustomDays(
 
     if (emailsError) {
       logger.debug(`Error fetching emails: ${emailsError}`);
-      await redisConnection.del(redisKey); // free up redis, let it try again
+      await redisEvictConnection.del(redisKey); // free up redis, let it try again
       return { success: false };
     }
 
@@ -273,7 +329,7 @@ export async function sendNotificationWithCustomDays(
         },
       ]);
 
-    if (process.env.SLACK_ADMIN_WEBHOOK_URL && emails.length > 0) {
+    if (process.env.SLACK_ADMIN_WEBHOOK_URL && emails.length > 0 && notificationType !== NotificationType.CONCURRENCY_LIMIT_REACHED) {
       sendSlackWebhook(
         `${getNotificationString(notificationType)}: Team ${team_id}, with email ${emails[0].email}.`,
         false,
@@ -285,7 +341,7 @@ export async function sendNotificationWithCustomDays(
 
     if (insertError) {
       logger.debug(`Error inserting notification record: ${insertError}`);
-      await redisConnection.del(redisKey); // free up redis, let it try again
+      await redisEvictConnection.del(redisKey); // free up redis, let it try again
       return { success: false };
     }
 

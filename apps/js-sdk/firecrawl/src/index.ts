@@ -1,7 +1,6 @@
 import axios, { type AxiosResponse, type AxiosRequestHeaders, AxiosError } from "axios";
 import * as zt from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { WebSocket } from "isows";
 import { TypedEventTarget } from "typescript-event-target";
 
 /**
@@ -69,6 +68,32 @@ export interface FirecrawlDocument<T = any, ActionsSchema extends (ActionsResult
   screenshot?: string;
   metadata?: FirecrawlDocumentMetadata;
   actions: ActionsSchema;
+  changeTracking?: {
+    previousScrapeAt: string | null;
+    changeStatus: "new" | "same" | "changed" | "removed";
+    visibility: "visible" | "hidden";
+    diff?: {
+      text: string;
+      json: {
+        files: Array<{
+          from: string | null;
+          to: string | null;
+          chunks: Array<{
+            content: string;
+            changes: Array<{
+              type: string;
+              normal?: boolean;
+              ln?: number;
+              ln1?: number;
+              ln2?: number;
+              content: string;
+            }>;
+          }>;
+        }>;
+      };
+    };
+    json?: any;
+  };
   // v1 search only
   title?: string;
   description?: string;
@@ -79,7 +104,7 @@ export interface FirecrawlDocument<T = any, ActionsSchema extends (ActionsResult
  * Defines the options and configurations available for scraping web content.
  */
 export interface CrawlScrapeOptions {
-  formats?: ("markdown" | "html" | "rawHtml" | "content" | "links" | "screenshot" | "screenshot@fullPage" | "extract" | "json")[];
+  formats?: ("markdown" | "html" | "rawHtml" | "content" | "links" | "screenshot" | "screenshot@fullPage" | "extract" | "json" | "changeTracking")[];
   headers?: Record<string, string>;
   includeTags?: string[];
   excludeTags?: string[];
@@ -94,7 +119,8 @@ export interface CrawlScrapeOptions {
   skipTlsVerification?: boolean;
   removeBase64Images?: boolean;
   blockAds?: boolean;
-  proxy?: "basic" | "stealth";
+  proxy?: "basic" | "stealth" | "auto";
+  storeInCache?: boolean;
 }
 
 export type Action = {
@@ -136,7 +162,14 @@ export interface ScrapeParams<LLMSchema extends zt.ZodSchema = any, ActionsSchem
     schema?: LLMSchema;
     systemPrompt?: string;
   }
+  changeTrackingOptions?: {
+    prompt?: string;
+    schema?: any;
+    modes?: ("json" | "git-diff")[];
+    tag?: string | null;
+  }
   actions?: ActionsSchema;
+  agent?: AgentOptions;
 }
 
 export interface ActionsResult {
@@ -184,6 +217,11 @@ export interface CrawlParams {
   deduplicateSimilarURLs?: boolean;
   ignoreQueryParameters?: boolean;
   regexOnFullURL?: boolean;
+  /**
+   * Delay in seconds between scrapes. This helps respect website rate limits.
+   * If not provided, the crawler may use the robots.txt crawl delay if available.
+   */
+  delay?: number;
 }
 
 /**
@@ -266,6 +304,21 @@ export interface MapResponse {
  * Parameters for extracting information from URLs.
  * Defines options for extracting information from URLs.
  */
+export interface AgentOptions {
+  model?: string;
+  prompt?: string;
+  sessionId?: string;
+}
+
+/**
+ * Parameters for extracting information from URLs.
+ * Defines options for extracting information from URLs.
+ */
+export interface AgentOptionsExtract {
+  model?: string;
+  sessionId?: string;
+}
+
 export interface ExtractParams<LLMSchema extends zt.ZodSchema = any> {
   prompt?: string;
   schema?: LLMSchema | object;
@@ -276,6 +329,7 @@ export interface ExtractParams<LLMSchema extends zt.ZodSchema = any> {
   origin?: string;
   showSources?: boolean;
   scrapeOptions?: CrawlScrapeOptions;
+  agent?: AgentOptionsExtract;
 }
 
 /**
@@ -469,6 +523,11 @@ export interface GenerateLLMsTextParams {
    */
   showFullText?: boolean;
   /**
+   * Whether to use cached content if available
+   * @default true
+   */
+  cache?: boolean;
+  /**
    * Experimental flag for streaming
    */
   __experimental_stream?: boolean;
@@ -503,9 +562,24 @@ export interface GenerateLLMsTextStatusResponse {
 export default class FirecrawlApp {
   public apiKey: string;
   public apiUrl: string;
-
+  public version: string =  "1.25.1";
+  
   private isCloudService(url: string): boolean {
     return url.includes('api.firecrawl.dev');
+  }
+
+  private async getVersion(): Promise<string> {
+    try {
+      const packageJson = await import('../package.json', { assert: { type: 'json' } });
+      return packageJson.default.version;
+    } catch (error) {
+      console.error("Error getting version:", error);
+      return  "1.25.1";
+    }
+  }
+
+  private async init() {
+    this.version = await this.getVersion();
   }
 
   /**
@@ -521,6 +595,7 @@ export default class FirecrawlApp {
 
     this.apiKey = apiKey || '';
     this.apiUrl = baseUrl;
+    this.init();
   }
 
   /**
@@ -537,7 +612,7 @@ export default class FirecrawlApp {
       "Content-Type": "application/json",
       Authorization: `Bearer ${this.apiKey}`,
     } as AxiosRequestHeaders;
-    let jsonData: any = { url, ...params };
+    let jsonData: any = { url, ...params, origin: `js-sdk@${this.version}` };
     if (jsonData?.extract?.schema) {
       let schema = jsonData.extract.schema;
 
@@ -619,7 +694,7 @@ export default class FirecrawlApp {
       lang: params?.lang ?? "en",
       country: params?.country ?? "us",
       location: params?.location,
-      origin: params?.origin ?? "api",
+      origin: `js-sdk@${this.version}`,
       timeout: params?.timeout ?? 60000,
       scrapeOptions: params?.scrapeOptions ?? { formats: [] },
     };
@@ -691,7 +766,7 @@ export default class FirecrawlApp {
     idempotencyKey?: string
   ): Promise<CrawlStatusResponse | ErrorResponse> {
     const headers = this.prepareHeaders(idempotencyKey);
-    let jsonData: any = { url, ...params };
+    let jsonData: any = { url, ...params, origin: `js-sdk@${this.version}` };
     try {
       const response: AxiosResponse = await this.postRequest(
         this.apiUrl + `/v1/crawl`,
@@ -720,7 +795,7 @@ export default class FirecrawlApp {
     idempotencyKey?: string
   ): Promise<CrawlResponse | ErrorResponse> {
     const headers = this.prepareHeaders(idempotencyKey);
-    let jsonData: any = { url, ...params };
+    let jsonData: any = { url, ...params, origin: `js-sdk@${this.version}` };
     try {
       const response: AxiosResponse = await this.postRequest(
         this.apiUrl + `/v1/crawl`,
@@ -896,7 +971,7 @@ export default class FirecrawlApp {
    */
   async mapUrl(url: string, params?: MapParams): Promise<MapResponse | ErrorResponse> {
     const headers = this.prepareHeaders();
-    let jsonData: { url: string } & MapParams = { url, ...params };
+    let jsonData: any = { url, ...params, origin: `js-sdk@${this.version}` };
 
     try {
       const response: AxiosResponse = await this.postRequest(
@@ -934,7 +1009,7 @@ export default class FirecrawlApp {
     ignoreInvalidURLs?: boolean,
   ): Promise<BatchScrapeStatusResponse | ErrorResponse> {
     const headers = this.prepareHeaders(idempotencyKey);
-    let jsonData: any = { urls, webhook, ignoreInvalidURLs, ...params };
+    let jsonData: any = { urls, webhook, ignoreInvalidURLs, ...params, origin: `js-sdk@${this.version}` };
     if (jsonData?.extract?.schema) {
       let schema = jsonData.extract.schema;
 
@@ -999,7 +1074,7 @@ export default class FirecrawlApp {
     ignoreInvalidURLs?: boolean,
   ): Promise<BatchScrapeResponse | ErrorResponse> {
     const headers = this.prepareHeaders(idempotencyKey);
-    let jsonData: any = { urls, webhook, ignoreInvalidURLs, ...(params ?? {}) };
+    let jsonData: any = { urls, webhook, ignoreInvalidURLs, ...params, origin: `js-sdk@${this.version}` };
     try {
       const response: AxiosResponse = await this.postRequest(
         this.apiUrl + `/v1/batch/scrape`,
@@ -1173,7 +1248,7 @@ export default class FirecrawlApp {
     try {
       const response: AxiosResponse = await this.postRequest(
         this.apiUrl + `/v1/extract`,
-        { ...jsonData, schema: jsonSchema, origin: params?.origin || "api-sdk" },
+        { ...jsonData, schema: jsonSchema, origin: `js-sdk@${this.version}` },
         headers
       );
 
@@ -1241,7 +1316,7 @@ export default class FirecrawlApp {
     try {
       const response: AxiosResponse = await this.postRequest(
         this.apiUrl + `/v1/extract`,
-        { ...jsonData, schema: jsonSchema },
+        { ...jsonData, schema: jsonSchema, origin: `js-sdk@${this.version}` },
         headers
       );
 
@@ -1418,6 +1493,13 @@ export default class FirecrawlApp {
    * @param {string} action - The action being performed when the error occurred.
    */
   handleError(response: AxiosResponse, action: string): void {
+    if (!response) {
+      throw new FirecrawlError(
+        `No response received while trying to ${action}. This may be a network error or the server is unreachable.`,
+        0
+      );
+    }
+
     if ([400, 402, 403, 408, 409, 500].includes(response.status)) {
       const errorMessage: string =
         response.data.error || "Unknown error occurred";
@@ -1532,7 +1614,7 @@ export default class FirecrawlApp {
    */
   async asyncDeepResearch(query: string, params: DeepResearchParams<zt.ZodSchema>): Promise<DeepResearchResponse | ErrorResponse> {
     const headers = this.prepareHeaders();
-    let jsonData: any = { query, ...params };
+    let jsonData: any = { query, ...params, origin: `js-sdk@${this.version}` };
 
     if (jsonData?.jsonOptions?.schema) {
       let schema = jsonData.jsonOptions.schema;
@@ -1540,7 +1622,7 @@ export default class FirecrawlApp {
       try {
         schema = zodToJsonSchema(schema);
       } catch (error) {
-        
+        // Ignore error if schema can't be parsed as Zod
       }
       jsonData = {
         ...jsonData,
@@ -1686,9 +1768,10 @@ export default class FirecrawlApp {
   async __asyncDeepResearch(topic: string, params: DeepResearchParams): Promise<DeepResearchResponse | ErrorResponse> {
     const headers = this.prepareHeaders();
     try {
+      let jsonData: any = { topic, ...params, origin: `js-sdk@${this.version}` };
       const response: AxiosResponse = await this.postRequest(
         `${this.apiUrl}/v1/deep-research`,
-        { topic, ...params },
+        jsonData,
         headers
       );
 
@@ -1798,10 +1881,11 @@ export default class FirecrawlApp {
    */
   async asyncGenerateLLMsText(url: string, params?: GenerateLLMsTextParams): Promise<GenerateLLMsTextResponse | ErrorResponse> {
     const headers = this.prepareHeaders();
+    let jsonData: any = { url, ...params, origin: `js-sdk@${this.version}` };
     try {
       const response: AxiosResponse = await this.postRequest(
         `${this.apiUrl}/v1/llmstxt`,
-        { url, ...params },
+        jsonData,
         headers
       );
 

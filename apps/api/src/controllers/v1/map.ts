@@ -5,6 +5,7 @@ import {
   mapRequestSchema,
   RequestWithAuth,
   scrapeOptions,
+  TeamFlags,
   TimeoutSignal,
 } from "./types";
 import { crawlToCrawler, StoredCrawl } from "../../lib/crawl-redis";
@@ -24,6 +25,7 @@ import { logger } from "../../lib/logger";
 import Redis from "ioredis";
 import { querySitemapIndex } from "../../scraper/WebScraper/sitemap-index";
 import { getIndexQueue } from "../../services/queue-service";
+import { queryIndexAtSplitLevel } from "../../services/index";
 
 configDotenv();
 const redis = new Redis(process.env.REDIS_URL!);
@@ -42,6 +44,14 @@ interface MapResult {
   mapResults: MapDocument[];
 }
 
+async function queryIndex(url: string, limit: number, useIndex: boolean): Promise<string[]> {
+  if (!useIndex) {
+    return [];
+  }
+
+  return await queryIndexAtSplitLevel(url, limit);
+}
+
 export async function getMapResults({
   url,
   search,
@@ -50,13 +60,14 @@ export async function getMapResults({
   includeSubdomains = true,
   crawlerOptions = {},
   teamId,
-  plan,
   origin,
   includeMetadata = false,
   allowExternalLinks,
   abort = new AbortController().signal, // noop
   mock,
   filterByPath = true,
+  flags,
+  useIndex = true,
 }: {
   url: string;
   search?: string;
@@ -65,13 +76,14 @@ export async function getMapResults({
   includeSubdomains?: boolean;
   crawlerOptions?: any;
   teamId: string;
-  plan?: string;
   origin?: string;
   includeMetadata?: boolean;
   allowExternalLinks?: boolean;
   abort?: AbortSignal;
   mock?: string;
   filterByPath?: boolean;
+  flags: TeamFlags;
+  useIndex?: boolean;
 }): Promise<MapResult> {
   const id = uuidv4();
   let links: string[] = [url];
@@ -85,13 +97,12 @@ export async function getMapResults({
       scrapeOptions: undefined,
     },
     scrapeOptions: scrapeOptions.parse({}),
-    internalOptions: {},
+    internalOptions: { teamId },
     team_id: teamId,
     createdAt: Date.now(),
-    plan: plan,
   };
 
-  const crawler = crawlToCrawler(id, sc);
+  const crawler = crawlToCrawler(id, sc, flags);
 
   try {
     sc.robots = await crawler.getRobotsTxt(false, abort);
@@ -165,10 +176,15 @@ export async function getMapResults({
     }
 
     // Parallelize sitemap index query with search results
-    const [sitemapIndexResult, ...searchResults] = await Promise.all([
+    const [sitemapIndexResult, indexResults, ...searchResults] = await Promise.all([
       querySitemapIndex(url, abort),
+      queryIndex(url, limit, useIndex),
       ...(cachedResult ? [] : pagePromises),
     ]);
+
+    if (indexResults.length > 0) {
+      links.push(...indexResults);
+    }
 
     const twoDaysAgo = new Date();
     twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
@@ -307,7 +323,14 @@ export async function mapController(
   req: RequestWithAuth<{}, MapResponse, MapRequest>,
   res: Response<MapResponse>,
 ) {
+  const originalRequest = req.body;
   req.body = mapRequestSchema.parse(req.body);
+
+  logger.info("Map request", {
+    request: req.body,
+    originalRequest,
+    teamId: req.auth.team_id,
+  });
 
   let result: Awaited<ReturnType<typeof getMapResults>>;
   const abort = new AbortController();
@@ -322,10 +345,11 @@ export async function mapController(
         crawlerOptions: req.body,
         origin: req.body.origin,
         teamId: req.auth.team_id,
-        plan: req.auth.plan,
         abort: abort.signal,
         mock: req.body.useMock,
         filterByPath: req.body.filterByPath !== false,
+        flags: req.acuc?.flags ?? null,
+        useIndex: req.body.useIndex,
       }),
       ...(req.body.timeout !== undefined ? [
         new Promise((resolve, reject) => setTimeout(() => {
@@ -366,6 +390,7 @@ export async function mapController(
     crawlerOptions: {},
     scrapeOptions: {},
     origin: req.body.origin ?? "api",
+    integration: req.body.integration,
     num_tokens: 0,
   });
 
